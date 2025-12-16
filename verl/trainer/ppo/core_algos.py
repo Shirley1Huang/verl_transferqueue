@@ -1629,6 +1629,7 @@ def compute_pf_ppo_reweight_data(
 
     batch_size = scores.shape[0]
     sample_indices = torch.multinomial(weights, batch_size, replacement=True)
+    # TQ controller 消费 sampler 可对接，输入自定义
 
     resampled_batch = {key: tensor[sample_indices] for key, tensor in data.batch.items()}
 
