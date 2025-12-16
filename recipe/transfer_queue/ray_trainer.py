@@ -24,6 +24,7 @@ import math
 import os
 import uuid
 from collections import defaultdict
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pprint import pprint
 from typing import Any, Optional
@@ -48,6 +49,7 @@ from transfer_queue import (
 
 from verl import DataProto
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
+from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import (
     RayClassWithInitArgs,
     RayResourcePool,
@@ -116,6 +118,7 @@ class ResourcePoolManager:
             # For FSDP backend, we recommend using max_colocate_count=1 that merge all WorkerGroups into one.
             # For Megatron backend, we recommend using max_colocate_count>1
             # that can utilize different WorkerGroup for differnt models
+            #####
             resource_pool = RayResourcePool(
                 process_on_nodes=process_on_nodes, use_gpu=True, max_colocate_count=1, name_prefix=resource_pool_name
             )
@@ -277,6 +280,7 @@ def compute_advantage(
     elif adv_estimator == AdvantageEstimator.GRPO:
         # Initialize the mask for GRPO calculation
         grpo_calculation_mask = data.batch["response_mask"]
+
         # Call compute_grpo_outcome_advantage with parameters matching its definition
         advantages, returns = core_algos.compute_grpo_outcome_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
@@ -386,7 +390,9 @@ class RayPPOTrainer:
         assert self.hybrid_engine, "Currently, only support hybrid engine"
 
         if self.hybrid_engine:
-            assert Role.ActorRollout in role_worker_mapping, f"{role_worker_mapping.keys()=}"
+            assert Role.ActorRollout in role_worker_mapping or Role.ActorRolloutRef in role_worker_mapping, (
+                f"{role_worker_mapping.keys()=}"
+            )
 
         self.role_worker_mapping = role_worker_mapping
         self.resource_pool_manager = resource_pool_manager
@@ -401,7 +407,10 @@ class RayPPOTrainer:
         )
 
         # if ref_in_actor is True, the reference policy will be actor without lora applied
-        self.ref_in_actor = config.actor_rollout_ref.model.get("lora_rank", 0) > 0
+        self.ref_in_actor = (
+            config.actor_rollout_ref.model.get("lora_rank", 0) > 0
+            or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
+        )
 
         # define in-reward KL control
         # kl loss control currently not suppoorted
@@ -484,11 +493,19 @@ class RayPPOTrainer:
 
         if train_dataset is None:
             train_dataset = create_rl_dataset(
-                self.config.data.train_files, self.config.data, self.tokenizer, self.processor
+                self.config.data.train_files,
+                self.config.data,
+                self.tokenizer,
+                self.processor,
+                max_samples=self.config.data.get("train_max_samples", -1),
             )
         if val_dataset is None:
             val_dataset = create_rl_dataset(
-                self.config.data.val_files, self.config.data, self.tokenizer, self.processor
+                self.config.data.val_files,
+                self.config.data,
+                self.tokenizer,
+                self.processor,
+                max_samples=self.config.data.get("val_max_samples", -1),
             )
         self.train_dataset, self.val_dataset = train_dataset, val_dataset
 
@@ -829,14 +846,15 @@ class RayPPOTrainer:
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
 
         # create actor and rollout
+        actor_role = Role.ActorRolloutRef if Role.ActorRolloutRef in self.role_worker_mapping else Role.ActorRollout
         if self.hybrid_engine:
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
+            resource_pool = self.resource_pool_manager.get_resource_pool(actor_role)
             actor_rollout_cls = RayClassWithInitArgs(
-                cls=self.role_worker_mapping[Role.ActorRollout],
+                cls=self.role_worker_mapping[actor_role],
                 config=self.config.actor_rollout_ref,
-                role="actor_rollout",
+                role=str(actor_role),
             )
-            self.resource_pool_to_cls[resource_pool]["actor_rollout"] = actor_rollout_cls
+            self.resource_pool_to_cls[resource_pool][str(actor_role)] = actor_rollout_cls
         else:
             raise NotImplementedError
 
@@ -845,24 +863,24 @@ class RayPPOTrainer:
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
             critic_cfg = omega_conf_to_dataclass(self.config.critic)
             critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=critic_cfg)
-            self.resource_pool_to_cls[resource_pool]["critic"] = critic_cls
+            self.resource_pool_to_cls[resource_pool][str(Role.Critic)] = critic_cls
 
         # create reference policy if needed
-        if self.use_reference_policy:
+        if self.use_reference_policy and Role.RefPolicy in self.role_worker_mapping:
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
             ref_policy_cls = RayClassWithInitArgs(
                 self.role_worker_mapping[Role.RefPolicy],
                 config=self.config.actor_rollout_ref,
-                role="ref",
+                role=str(Role.RefPolicy),
             )
-            self.resource_pool_to_cls[resource_pool]["ref"] = ref_policy_cls
+            self.resource_pool_to_cls[resource_pool][str(Role.RefPolicy)] = ref_policy_cls
 
         # create a reward model if reward_fn is None
         if self.use_rm:
             # we create a RM here
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
             rm_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RewardModel], config=self.config.reward_model)
-            self.resource_pool_to_cls[resource_pool]["rm"] = rm_cls
+            self.resource_pool_to_cls[resource_pool][str(Role.RewardModel)] = rm_cls
 
         # initialize WorkerGroup
         # NOTE: if you want to use a different resource pool for each role, which can support different parallel size,
@@ -897,20 +915,26 @@ class RayPPOTrainer:
             all_wg.update(spawn_wg)
 
         if self.use_critic:
-            self.critic_wg = all_wg["critic"]
+            self.critic_wg = all_wg[str(Role.Critic)]
             self.critic_wg.init_model()
 
         if self.use_reference_policy and not self.ref_in_actor:
-            self.ref_policy_wg = all_wg["ref"]
-            self.ref_policy_wg.init_model()
+            if str(Role.RefPolicy) in all_wg:
+                self.ref_policy_wg = all_wg[str(Role.RefPolicy)]
+                self.ref_policy_wg.init_model()
+            else:
+                # Model engine: ActorRolloutRefWorker
+                assert str(Role.ActorRolloutRef) in all_wg, f"{all_wg.keys()=}"
+                self.ref_policy_wg = all_wg[str(Role.ActorRolloutRef)]
 
         self.rm_wg = None
+        # initalization of rm_wg will be deprecated in the future
         if self.use_rm:
-            self.rm_wg = all_wg["rm"]
+            self.rm_wg = all_wg[str(Role.RewardModel)]
             self.rm_wg.init_model()
 
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
-        self.actor_rollout_wg = all_wg["actor_rollout"]
+        self.actor_rollout_wg = all_wg[str(actor_role)]
         self.actor_rollout_wg.init_model()
 
         # set transferqueue server info for each worker
@@ -920,7 +944,7 @@ class RayPPOTrainer:
         # create async rollout manager and request scheduler
         self.async_rollout_mode = False
         if self.config.actor_rollout_ref.rollout.mode == "async":
-            from .agent_loop import AgentLoopManager
+            from verl.experimental.agent_loop import AgentLoopManager
 
             self.async_rollout_mode = True
             if self.config.reward_model.enable and self.config.reward_model.enable_resource_pool:
@@ -972,11 +996,13 @@ class RayPPOTrainer:
         )
 
         if self.use_critic:
-            critic_local_path = os.path.join(local_global_step_folder, "critic")
+            critic_local_path = os.path.join(local_global_step_folder, str(Role.Critic))
             critic_remote_path = (
                 None
                 if self.config.trainer.default_hdfs_dir is None
-                else os.path.join(self.config.trainer.default_hdfs_dir, f"global_step_{self.global_steps}", "critic")
+                else os.path.join(
+                    self.config.trainer.default_hdfs_dir, f"global_step_{self.global_steps}", str(Role.Critic)
+                )
             )
             self.critic_wg.save_checkpoint(
                 critic_local_path, critic_remote_path, self.global_steps, max_ckpt_to_keep=max_critic_ckpt_to_keep
@@ -989,6 +1015,15 @@ class RayPPOTrainer:
         torch.save(dataloader_state_dict, dataloader_local_path)
 
         # latest checkpointed iteration tracker (for atomic usage)
+        if (
+            hasattr(self.config.actor_rollout_ref.actor.checkpoint, "async_save")
+            and self.config.actor_rollout_ref.actor.checkpoint.async_save
+        ) or (
+            "async_save" in self.config.actor_rollout_ref.actor.checkpoint
+            and self.config.actor_rollout_ref.actor.checkpoint["async_save"]
+        ):
+            print("skip write latest_checkpointed_iteration.txt when async_save is True")
+            return
         local_latest_checkpointed_iteration = os.path.join(
             self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt"
         )
@@ -1032,7 +1067,7 @@ class RayPPOTrainer:
         print(f"Resuming from {global_step_folder}")
 
         actor_path = os.path.join(global_step_folder, "actor")
-        critic_path = os.path.join(global_step_folder, "critic")
+        critic_path = os.path.join(global_step_folder, str(Role.Critic))
         # load actor
         self.actor_rollout_wg.load_checkpoint(
             actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
@@ -1083,18 +1118,18 @@ class RayPPOTrainer:
         attention_mask = data["attention_mask"]
         batch_size = attention_mask.shape[0]
         global_seqlen_lst = data["attention_mask"].view(batch_size, -1).sum(-1)  # (train_batch_size,)
-        global_seqlen_lst = calculate_workload(global_seqlen_lst)
+        workload_lst = calculate_workload(global_seqlen_lst)
         world_size = self.actor_rollout_wg.world_size
         if keep_minibatch:
             # Decouple the DP balancing and mini-batching.
             minibatch_size = self.config.actor_rollout_ref.actor.get("ppo_mini_batch_size", None)
             if minibatch_size is None:
                 raise ValueError("'ppo_mini_batch_size' must be set in actor config when 'keep_minibatch' is True.")
-            minibatch_num = len(global_seqlen_lst) // minibatch_size
+            minibatch_num = len(workload_lst) // minibatch_size
             global_partition_lst = [[] for _ in range(world_size)]
             for i in range(minibatch_num):
                 rearrange_minibatch_lst = get_seqlen_balanced_partitions(
-                    global_seqlen_lst[i * minibatch_size : (i + 1) * minibatch_size],
+                    workload_lst[i * minibatch_size : (i + 1) * minibatch_size],
                     k_partitions=world_size,
                     equal_size=True,
                 )
@@ -1102,11 +1137,11 @@ class RayPPOTrainer:
                     global_partition_lst[j].extend([x + minibatch_size * i for x in part])
         else:
             global_partition_lst = get_seqlen_balanced_partitions(
-                global_seqlen_lst, k_partitions=world_size, equal_size=True
+                workload_lst, k_partitions=world_size, equal_size=True
             )
         # Place smaller micro-batches at both ends to reduce the bubbles in pipeline parallel.
         for idx, partition in enumerate(global_partition_lst):
-            partition.sort(key=lambda x: (global_seqlen_lst[x], x))
+            partition.sort(key=lambda x: (workload_lst[x], x))
             ordered_partition = partition[::2] + partition[1::2][::-1]
             global_partition_lst[idx] = ordered_partition
         # reorder based on index. The data will be automatically equally partitioned by dispatch function
@@ -1211,6 +1246,8 @@ class RayPPOTrainer:
         # load checkpoint before doing anything
         self._load_checkpoint()
 
+        current_epoch = self.global_steps // len(self.train_dataloader)
+
         # perform validation before training
         # currently, we only support validation using the reward_function.
         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
@@ -1241,8 +1278,10 @@ class RayPPOTrainer:
         )
         next_step_profile = False
 
-        for epoch in range(self.config.trainer.total_epochs):
+        for epoch in range(current_epoch, self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
+                if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
+                    self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
                 metrics = {}
                 timing_raw = {}
                 base_get_meta_kwargs = dict(
@@ -1272,7 +1311,6 @@ class RayPPOTrainer:
                 gen_meta.set_extra_info("global_steps", self.global_steps)
 
                 is_last_step = self.global_steps >= self.total_training_steps
-
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
@@ -1494,7 +1532,6 @@ class RayPPOTrainer:
                             batch_meta = batch_meta.union(token_level_scores_meta)
 
                         # compute advantages, executed on the driver process
-
                         norm_adv_by_std_in_grpo = self.config.algorithm.get(
                             "norm_adv_by_std_in_grpo", True
                         )  # GRPO adv normalization factor
@@ -1709,6 +1746,8 @@ class RayPPOTrainer:
                     )
 
                 if is_last_step:
+                    if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
+                        self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
                     return
