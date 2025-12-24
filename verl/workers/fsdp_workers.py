@@ -36,6 +36,8 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.api import FullStateDictConfig, ShardedStateDictConfig, StateDictType
 
+from verl.utils.transferqueue_utils import tqbridge
+
 try:
     # for torch 2.5+
     from torch.distributed.tensor import DTensor
@@ -1881,6 +1883,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 
         return DataProto.from_dict(rm_inputs)
 
+    @tqbridge(put_data=False)
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="reward"))
     @DistProfiler.annotate(color="brown", role="compute_rm_score")
     def compute_rm_score(self, data: DataProto):
