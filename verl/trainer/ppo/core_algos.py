@@ -1709,7 +1709,7 @@ def compute_pf_ppo_reweight_data_tq(
     weights = torch.clamp(weights + 1e-8, min=1e-8)
 
     batch_size = scores.shape[0]
-    sample_indices = torch.multinomial(weights, batch_size, replacement=True)
+    sample_indices = torch.multinomial(weights, batch_size, replacement=True).tolist()
     # TQ controller 消费 sampler 可对接，输入自定义
 
     return sample_indices
