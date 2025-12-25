@@ -238,7 +238,7 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
 #
 #     return batch_meta
 
-@tqbridge(put_data=False)
+@tqbridge(put_data=True)
 def compute_advantage(
     data: DataProto,
     adv_estimator: AdvantageEstimator,
@@ -286,18 +286,20 @@ def compute_advantage(
         if config.get("use_pf_ppo", False):
             # the below code will resample the full data, for TQ adaption, we will return the resampled index
             if config.transfer_queue.get("enable"):
-                data_resample_idx = core_algos.compute_pf_ppo_reweight_data_tq(
+                pf_ppo_reweight_idx = core_algos.compute_pf_ppo_reweight_data_tq(
                     data.batch["token_level_rewards"],
                     config.pf_ppo.get("reweight_method"),
                     config.pf_ppo.get("weight_pow"),
-                ) # it is a torch.tensor
+                ) # it is a 2d torch.tensor, no no let it be a list of int
                 # 简易版
-                # return advantages, returns, data_resample_idx
+                # return advantages, returns, pf_ppo_reweight_idx
                 advantages_td = TensorDict(
-                    {"advantages": advantages, "returns": returns}, batch_size=advantages.size(0)
+                    {"advantages": advantages, "returns": returns,
+                     # "pf_ppo_reweight_idx": pf_ppo_reweight_idx,
+                     }, batch_size=advantages.size(0)
                 )
-                non_tensor_batch = {"__pf_ppo_reweight_idx__": data_resample_idx}
-                return DataProto(batch=advantages_td, non_tensor_batch = non_tensor_batch)
+                non_tensor_batch = {"pf_ppo_reweight_idx": pf_ppo_reweight_idx}
+                return DataProto(batch = dvantages_td, non_tensor_batch = non_tensor_batch)
             else:
                 # resample the real data
                 data = core_algos.compute_pf_ppo_reweight_data(
@@ -305,8 +307,6 @@ def compute_advantage(
                     config.pf_ppo.get("reweight_method"),
                     config.pf_ppo.get("weight_pow"),
                 )
-                return data
-
     elif adv_estimator == AdvantageEstimator.GRPO:
         # Initialize the mask for GRPO calculation
         grpo_calculation_mask = data.batch["response_mask"]
@@ -2029,17 +2029,13 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
-
-                        advantages_td = TensorDict(
-                            {"advantages": advantages, "returns": returns}, batch_size=advantages.size(0)
-                        )
-                        compute_advantage_meta = asyncio.run(
-                            self.tq_client.async_put(data=advantages_td, metadata=compute_advantage_meta)
-                        )
                         batch_meta = batch_meta.union(compute_advantage_meta)
 
-                        if resampled_idx is not None:
-
+                        if "resampled_idx" in batch_meta.field_names and self.config.transferqueue.enable:
+                            # resample the idx of batch meta
+                            resample_idx_meta = batch_meta.select_fields(["pf_ppo_reweight_idx"])
+                            resampled_idx = asyncio.run(tq_client.async_get_data(resample_idx_meta)) # list of int
+                            batch_meta.reorder(resampled_idx)
 
                     # update critic
                     if self.use_critic:
