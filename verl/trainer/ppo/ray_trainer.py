@@ -158,7 +158,7 @@ class ResourcePoolManager:
                 f"Total available GPUs {total_available_gpus} is less than total desired GPUs {total_required_gpus}"
             )
 
-
+# TODO(TQ): Check if all needed
 @tqbridge(put_data=False)
 def compute_reward_decorated(data, reward_fn):
     return compute_reward(data, reward_fn)
@@ -211,32 +211,32 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     return token_level_rewards, metrics
 
 
-# TODO(TQ): need to improve
-# 可优化，TQ已经存了shape - 改完后：分类1
-def compute_response_mask(batch_meta: BatchMeta, tq_client):
-    """Compute the attention mask for the response part of the sequence.
-
-    This function extracts the portion of the attention mask that corresponds to the model's response,
-    which is used for masking computations that should only apply to response tokens.
-
-    Args:
-        batch_meta (BatchMeta): The data containing batched model outputs and inputs.
-
-    Returns:
-        BatchMeta: The BatchMeta of attention mask for the response tokens.
-    """
-    data = asyncio.run(tq_client.async_get_data(batch_meta))
-
-    responses = data["responses"]
-    response_length = responses.size(1)
-    attention_mask = data["attention_mask"]
-    response_mask = attention_mask[:, -response_length:]
-    output = TensorDict({"response_mask": response_mask}, batch_size=response_mask.size(0))
-
-    asyncio.run(tq_client.async_put(data=output, metadata=batch_meta))
-    batch_meta.add_fields(output)
-
-    return batch_meta
+# # TODO(TQ): 冗余代码
+# # 可优化，TQ已经存了shape - 改完后：分类1
+# def compute_response_mask(batch_meta: BatchMeta, tq_client):
+#     """Compute the attention mask for the response part of the sequence.
+#
+#     This function extracts the portion of the attention mask that corresponds to the model's response,
+#     which is used for masking computations that should only apply to response tokens.
+#
+#     Args:
+#         batch_meta (BatchMeta): The data containing batched model outputs and inputs.
+#
+#     Returns:
+#         BatchMeta: The BatchMeta of attention mask for the response tokens.
+#     """
+#     data = asyncio.run(tq_client.async_get_data(batch_meta))
+#
+#     responses = data["responses"]
+#     response_length = responses.size(1)
+#     attention_mask = data["attention_mask"]
+#     response_mask = attention_mask[:, -response_length:]
+#     output = TensorDict({"response_mask": response_mask}, batch_size=response_mask.size(0))
+#
+#     asyncio.run(tq_client.async_put(data=output, metadata=batch_meta))
+#     batch_meta.add_fields(output)
+#
+#     return batch_meta
 
 @tqbridge(put_data=False)
 def compute_advantage(
@@ -247,7 +247,7 @@ def compute_advantage(
     num_repeat: int = 1,
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
-) -> tuple[Any, Any]:
+) -> Union[tuple[Any, Any], tuple[Any, Any, Any]]:
     """Compute advantage estimates for policy optimization.
 
     This function computes advantage estimates using various estimators like GAE, GRPO, REINFORCE++, etc.
@@ -270,8 +270,7 @@ def compute_advantage(
     """
     # Back-compatible with trainers that do not compute response mask in fit
     # TODO(TQ): need to pass tq_client as well now 函数不兼容
-    # if "response_mask" not in data.batch.keys():
-    #     data.batch["response_mask"] = compute_response_mask(data)
+    # already assert to check in fit()
 
     # prepare response group
     if adv_estimator == AdvantageEstimator.GAE:
@@ -285,11 +284,29 @@ def compute_advantage(
         )
         # TODO (TQ): adapt core_algos.compute_pf_ppo_reweight_data function to support transfer queue
         if config.get("use_pf_ppo", False):
-            data = core_algos.compute_pf_ppo_reweight_data(
-                data,
-                config.pf_ppo.get("reweight_method"),
-                config.pf_ppo.get("weight_pow"),
-            )
+            # the below code will resample the full data, for TQ adaption, we will return the resampled index
+            if config.transfer_queue.get("enable"):
+                data_resample_idx = core_algos.compute_pf_ppo_reweight_data_tq(
+                    data.batch["token_level_rewards"],
+                    config.pf_ppo.get("reweight_method"),
+                    config.pf_ppo.get("weight_pow"),
+                ) # it is a torch.tensor
+                # 简易版
+                # return advantages, returns, data_resample_idx
+                advantages_td = TensorDict(
+                    {"advantages": advantages, "returns": returns}, batch_size=advantages.size(0)
+                )
+                non_tensor_batch = {"__pf_ppo_reweight_idx__": data_resample_idx}
+                return DataProto(batch=advantages_td, non_tensor_batch = non_tensor_batch)
+            else:
+                # resample the real data
+                data = core_algos.compute_pf_ppo_reweight_data(
+                    data,
+                    config.pf_ppo.get("reweight_method"),
+                    config.pf_ppo.get("weight_pow"),
+                )
+                return data
+
     elif adv_estimator == AdvantageEstimator.GRPO:
         # Initialize the mask for GRPO calculation
         grpo_calculation_mask = data.batch["response_mask"]
@@ -316,7 +333,15 @@ def compute_advantage(
 
         # calculate advantage estimator
         advantages, returns = adv_estimator_fn(**adv_kwargs)
-    return advantages, returns
+
+    if config.transfer_queue.get("enable"):
+        advantages_td = TensorDict(
+            {"advantages": advantages, "returns": returns}, batch_size=advantages.size(0)
+        )
+        return DataProto(batch=advantages_td)
+    else:
+        return data
+    # 简易版 return advantages, returns, _
 
 
 @tqbridge(put_data=False)
@@ -1706,17 +1731,20 @@ class RayPPOTrainer:
                             del rm_scores_output_meta, gen_baseline_meta, gen_baseline_output_meta
 
                     batch_meta = batch_meta.union(gen_output_meta)
+                    # gen_output_meta 应该包含 updated 后的meta，例如 response mask meta
 
-                    if "response_mask" not in batch_meta.field_names:
-                        response_mask_meta = asyncio.run(
-                            self.tq_client.async_get_meta(
-                                data_fields=["responses", "attention_mask"],
-                                task_name="compute_response_mask",
-                                **base_get_meta_kwargs,
-                            )
-                        )
-                        response_mask_output_meta = compute_response_mask(response_mask_meta, self.tq_client)
-                        batch_meta = batch_meta.union(response_mask_output_meta)
+                    assert  "response_mask" in batch_meta.field_names
+                    # # TODO(TQ): 冗余代码，不应该没有response mask
+                    # if "response_mask" not in batch_meta.field_names:
+                    #     response_mask_meta = asyncio.run(
+                    #         self.tq_client.async_get_meta(
+                    #             data_fields=["responses", "attention_mask"],
+                    #             task_name="compute_response_mask",
+                    #             **base_get_meta_kwargs,
+                    #         )
+                    #     )
+                    #     response_mask_output_meta = compute_response_mask(response_mask_meta, self.tq_client)
+                    #     batch_meta = batch_meta.union(response_mask_output_meta)
 
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
@@ -1958,11 +1986,12 @@ class RayPPOTrainer:
                         # within compute_advantage():
                         # if "response_mask" not in data.batch.keys():
                         #     data.batch["response_mask"] = compute_response_mask(data)
-                        # 应该不用担心，因为前面处理过了？算了再重复一次吧
-                        if "response_mask" not in batch_meta.field_names:
-                            response_mask_meta = batch_meta.select_fields(["responses", "attention_mask"])
-                            response_mask_output_meta = compute_response_mask(response_mask_meta, self.tq_client)
-                            batch_meta = batch_meta.union(response_mask_output_meta)
+                        # 应该不用担心，因为agent_loop_worker保存过了
+                        # if "response_mask" not in batch_meta.field_names:
+                        #     response_mask_meta = batch_meta.select_fields(["responses", "attention_mask"])
+                        #     response_mask_output_meta = compute_response_mask(response_mask_meta, self.tq_client)
+                        #     batch_meta = batch_meta.union(response_mask_output_meta)
+                        assert "response_mask" in batch_meta.field_names
 
                         compute_advantage_fields = [
                             "response_mask",
@@ -1980,7 +2009,18 @@ class RayPPOTrainer:
 
                         compute_advantage_meta = batch_meta.select_fields(compute_advantage_fields)
 
-                        advantages, returns = compute_advantage(
+                        # resampled_idx = None
+                        # advantages, returns, resampled_idx = compute_advantage(
+                        #     compute_advantage_meta,
+                        #     adv_estimator=self.config.algorithm.adv_estimator,
+                        #     gamma=self.config.algorithm.gamma,
+                        #     lam=self.config.algorithm.lam,
+                        #     num_repeat=self.config.actor_rollout_ref.rollout.n,
+                        #     norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                        #     config=self.config.algorithm,
+                        # )
+
+                        compute_advantage_meta = compute_advantage(
                             compute_advantage_meta,
                             adv_estimator=self.config.algorithm.adv_estimator,
                             gamma=self.config.algorithm.gamma,
@@ -1997,6 +2037,9 @@ class RayPPOTrainer:
                             self.tq_client.async_put(data=advantages_td, metadata=compute_advantage_meta)
                         )
                         batch_meta = batch_meta.union(compute_advantage_meta)
+
+                        if resampled_idx is not None:
+
 
                     # update critic
                     if self.use_critic:
