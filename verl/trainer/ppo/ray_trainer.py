@@ -1301,22 +1301,17 @@ class RayPPOTrainer:
             if self.use_rm and not self.use_reward_loop:
                 self.rm_wg.stop_profile()
 
-    def _balance_batch(
-        self, batch: BatchMeta, tq_client, metrics, logging_prefix="global_seqlen", keep_minibatch=False
-    ):
-        """Reorder the batchmeta on single controller such that each dp rank gets similar total tokens"""
-        data = asyncio.run(tq_client.async_get_data(batch))
-
-        attention_mask = data["attention_mask"]
+    @tqbridge(put_data=False)
+    def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
+        """Reorder the data on single controller such that each dp rank gets similar total tokens"""
+        attention_mask = batch.batch["attention_mask"]
         batch_size = attention_mask.shape[0]
-        global_seqlen_lst = data["attention_mask"].view(batch_size, -1).sum(-1)  # (train_batch_size,)
+        global_seqlen_lst = batch.batch["attention_mask"].view(batch_size, -1).sum(-1)  # (train_batch_size,)
         workload_lst = calculate_workload(global_seqlen_lst)
         world_size = self.actor_rollout_wg.world_size
         if keep_minibatch:
             # Decouple the DP balancing and mini-batching.
-            minibatch_size = self.config.actor_rollout_ref.actor.get("ppo_mini_batch_size", None)
-            if minibatch_size is None:
-                raise ValueError("'ppo_mini_batch_size' must be set in actor config when 'keep_minibatch' is True.")
+            minibatch_size = self.config.actor_rollout_ref.actor.get("ppo_mini_batch_size")
             minibatch_num = len(workload_lst) // minibatch_size
             global_partition_lst = [[] for _ in range(world_size)]
             for i in range(minibatch_num):
@@ -1337,12 +1332,20 @@ class RayPPOTrainer:
             ordered_partition = partition[::2] + partition[1::2][::-1]
             global_partition_lst[idx] = ordered_partition
         # reorder based on index. The data will be automatically equally partitioned by dispatch function
-        global_idx = [j for partition in global_partition_lst for j in partition]
-        global_balance_stats = log_seqlen_unbalance(
-            seqlen_list=global_seqlen_lst, partitions=global_partition_lst, prefix=logging_prefix
-        )
-        metrics.update(global_balance_stats)
-        return global_idx
+        if self.config.transfer_queue.enable:
+            global_idx = [j for partition in global_partition_lst for j in partition]
+            global_balance_stats = log_seqlen_unbalance(
+                seqlen_list=global_seqlen_lst, partitions=global_partition_lst, prefix=logging_prefix
+            )
+            metrics.update(global_balance_stats)
+            return global_idx
+        else:
+            global_idx = torch.tensor([j for partition in global_partition_lst for j in partition])
+            batch.reorder(global_idx)
+            global_balance_stats = log_seqlen_unbalance(
+                seqlen_list=global_seqlen_lst, partitions=global_partition_lst, prefix=logging_prefix
+            )
+            metrics.update(global_balance_stats)
 
     @classmethod
     def repeat_dict(
@@ -1415,7 +1418,7 @@ class RayPPOTrainer:
 
         return TensorDict(tensors_batch, batch_size=batch_size)
 
-    # TODO(TQ): 下面几个函数都是12.15检查新增的
+    # TODO(TQ): 下面几个函数都是12.15检查新增的，先简单用bridge适配
     @tqbridge(put_data=False)
     def _compute_values(self, batch: DataProto) -> DataProto:
         if self.use_legacy_worker_impl == "disable":
@@ -1644,7 +1647,11 @@ class RayPPOTrainer:
 
                 # TODO(TQ): already wrapped _get_gen_batch with @tqbridge
                 # 但是实际上不需要经过dataproto做两次转换
-                gen_meta = self._get_gen_batch(batch_meta)
+                # gen_meta = self._get_gen_batch(batch_meta)
+                gen_batch_fields = self._get_gen_batch_fields(set(batch_meta.field_names),
+                                                              set(batch.non_tensor_keys))
+                gen_meta = batch_meta.select_fields(list(gen_batch_fields))
+
                 # pass global_steps to trace
                 gen_meta.set_extra_info("global_steps", self.global_steps)
 
