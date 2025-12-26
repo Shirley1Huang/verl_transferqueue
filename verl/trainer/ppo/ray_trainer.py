@@ -854,7 +854,7 @@ class RayPPOTrainer:
             print(f"test_gen_batch meta info: {test_gen_meta.extra_info}")
 
             # TODO(TQ): Support pad and unpad to make DataProto divisible by dp_size with TransferQueue
-            # 长期不会有pad unpad
+            # 0.7.x版本不会有pad unpad
             if not self.async_rollout_mode:
                 test_output_gen_meta = self.actor_rollout_wg.generate_sequences(test_gen_meta)
             else:
@@ -884,7 +884,7 @@ class RayPPOTrainer:
             if "rm_scores" in batch_meta.field_names:
                 compute_reward_fields = ["rm_scores"]
             val_reward_meta = test_batch_meta.select_fields(compute_reward_fields)
-            val_reward_meta.update_extra_info(test_batch_meta.extra_info)
+            # val_reward_meta.update_extra_info(test_batch_meta.extra_info) # 不需要，应该自带 test_batch_meta的extra info
             result = self._compute_or_extract_reward(val_reward_meta, reward_fn=self.val_reward_fn, return_dict=True)
             reward_tensor = result["reward_tensor"]
             scores = reward_tensor.sum(-1).cpu().tolist()
@@ -1645,9 +1645,9 @@ class RayPPOTrainer:
                 )
                 batch_meta.set_extra_info("temperature", self.config.actor_rollout_ref.rollout.temperature)
 
-                # TODO(TQ): already wrapped _get_gen_batch with @tqbridge
-                # 但是实际上不需要经过dataproto做两次转换
+                # TODO(TQ) HY modified: already wrapped _get_gen_batch with @tqbridge
                 # gen_meta = self._get_gen_batch(batch_meta)
+                # 但是实际上不需要经过dataproto做两次转换，可以直接修改需要的fields然后取对应batchmeta
                 gen_batch_fields = self._get_gen_batch_fields(set(batch_meta.field_names),
                                                               set(batch.non_tensor_keys))
                 gen_meta = batch_meta.select_fields(list(gen_batch_fields))
@@ -1666,10 +1666,11 @@ class RayPPOTrainer:
                         timing_raw.update(gen_output_meta.extra_info["timing"])
                         gen_output_meta.extra_info.pop("timing", None)
 
-                    # TODO (TQ): support transfer queue
+                    # TODO (TQ) HY modified: support transfer queue
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
                             raise ValueError("A reward_fn is required for REMAX advantage estimation.")
+
                         with marked_timer("gen_max", timing_raw, color="purple"):
                             gen_baseline_meta = deepcopy(gen_meta)
                             gen_baseline_meta.set_extra_info("do_sample", False)
