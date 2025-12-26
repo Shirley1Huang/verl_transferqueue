@@ -830,15 +830,6 @@ class RayPPOTrainer:
             # Store original inputs
             test_batch_meta = asyncio.run(self.tq_client.async_put(data=test_batch, partition_id=f"val_{self.global_steps - 1}"))
             batch_meta = test_batch_meta.select_fields(["input_ids", "uid", "reward_model"])
-
-            # batch_meta = asyncio.run(
-            #     self.tq_client.async_get_meta(
-            #         data_fields=["input_ids", "uid", "reward_model"],
-            #         batch_size=test_batch.batch_size[0],
-            #         partition_id=f"val_{self.global_steps - 1}",
-            #         task_name="get_data",
-            #     )
-            # )
             data = asyncio.run(self.tq_client.async_get_data(batch_meta))
             input_ids = data["input_ids"]
             # TODO: Can we keep special tokens except for padding tokens?
@@ -851,18 +842,7 @@ class RayPPOTrainer:
 
             test_gen_fields = self._get_gen_batch_fields(set(test_batch_meta.field_names), # namely, batch_meta.field_names
                                                          set(test_batch.non_tensor_keys))
-
             test_gen_meta = test_batch_meta.select_fields(list(test_gen_fields))
-
-            # test_gen_meta = asyncio.run(
-            #     self.tq_client.async_get_meta(
-            #         data_fields=list(test_gen_fields), # list(test_batch.keys()), # 把所有的列的meta都取出来了
-            #         # TODO(TQ) HY updated: Get metadata by specified fields
-            #         batch_size=test_batch.batch_size[0],
-            #         partition_id=f"val_{self.global_steps - 1}",  # self.global_steps start from 1
-            #         task_name="generate_sequences",
-            #     )
-            # )
             test_gen_meta.extra_info = {
                 "eos_token_id": self.tokenizer.eos_token_id,
                 "pad_token_id": self.tokenizer.pad_token_id,
@@ -873,22 +853,12 @@ class RayPPOTrainer:
             }
             print(f"test_gen_batch meta info: {test_gen_meta.extra_info}")
 
-            # TODO(TQ): Support padding and unpadding to make DataProto divisible by dp_size with TransferQueue
+            # TODO(TQ): Support pad and unpad to make DataProto divisible by dp_size with TransferQueue
             # 长期不会有pad unpad
-            # pad to be divisible by dp_size
-            # size_divisor = (
-            #     self.actor_rollout_wg.world_size
-            #     if not self.async_rollout_mode
-            #     else self.config.actor_rollout_ref.rollout.agent.num_workers
-            # )
-            # test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
             if not self.async_rollout_mode:
                 test_output_gen_meta = self.actor_rollout_wg.generate_sequences(test_gen_meta)
             else:
                 test_output_gen_meta = self.async_rollout_manager.generate_sequences(test_gen_meta)
-
-            # # unpad
-            # test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
 
             test_batch_meta = test_batch_meta.union(test_output_gen_meta)
 
@@ -896,14 +866,6 @@ class RayPPOTrainer:
 
             # Store generated outputs
             test_response_meta = test_output_gen_meta.select_fields(["responses"])
-            # test_response_meta = asyncio.run(
-            #     self.tq_client.async_get_meta(
-            #         data_fields=["responses"],
-            #         batch_size=test_batch.batch_size[0],
-            #         partition_id=f"val_{self.global_steps - 1}",  # self.global_steps start from 1
-            #         task_name="get_response",
-            #     )
-            # )
             data = asyncio.run(self.tq_client.async_get_data(test_response_meta))
             output_ids = data["responses"]
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
@@ -922,16 +884,7 @@ class RayPPOTrainer:
             if "rm_scores" in batch_meta.field_names:
                 compute_reward_fields = ["rm_scores"]
             val_reward_meta = test_batch_meta.select_fields(compute_reward_fields)
-            # val_reward_meta = asyncio.run(
-            #     self.tq_client.async_get_meta(
-            #         data_fields=compute_reward_fields,
-            #         batch_size=test_batch.batch_size[0],
-            #         partition_id=f"val_{self.global_steps - 1}",
-            #         task_name="compute_reward",
-            #     )
-            # )
             val_reward_meta.update_extra_info(test_batch_meta.extra_info)
-            # TODO(TQ): new update 1224
             result = self._compute_or_extract_reward(val_reward_meta, reward_fn=self.val_reward_fn, return_dict=True)
             reward_tensor = result["reward_tensor"]
             scores = reward_tensor.sum(-1).cpu().tolist()
@@ -950,28 +903,12 @@ class RayPPOTrainer:
             # collect num_turns of each prompt
             if "__num_turns__" in test_batch_meta.field_names:
                 num_turns_meta = test_batch_meta.select_fields(["__num_turns__"])
-                # num_turns_meta = asyncio.run(
-                #     self.tq_client.async_get_meta(
-                #         data_fields=["__num_turns__"],
-                #         batch_size=test_batch.batch_size[0],
-                #         partition_id=f"val_{self.global_steps - 1}",  # self.global_steps start from 1
-                #         task_name="get_num_turns",
-                #     )
-                # )
                 data = asyncio.run(self.tq_client.async_get_data(num_turns_meta))
                 sample_turns.append(data["__num_turns__"])
 
             data_source = ["unknown"] * reward_tensor.shape[0]
             if "data_source" in test_batch_meta.field_names:
                 data_source_meta = test_batch_meta.select_fields(["data_source"])
-                # data_source_meta = asyncio.run(
-                #     self.tq_client.async_get_meta(
-                #         data_fields=["data_source"],
-                #         batch_size=test_batch.batch_size[0],
-                #         partition_id=f"val_{self.global_steps - 1}",  # self.global_steps start from 1
-                #         task_name="get_data_source",
-                #     )
-                # )
                 data = asyncio.run(self.tq_client.async_get_data(data_source_meta))
                 data_source = data["data_source"]
 
@@ -1051,7 +988,31 @@ class RayPPOTrainer:
         # create critic
         if self.use_critic:
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
-            critic_cfg = omega_conf_to_dataclass(self.config.critic)
+
+            from verl.workers.config import CriticConfig
+
+            critic_cfg: CriticConfig = omega_conf_to_dataclass(self.config.critic)
+
+            if self.use_legacy_worker_impl == "disable":
+                # convert critic_cfg into TrainingWorkerConfig
+                from verl.workers.engine_workers import TrainingWorkerConfig
+
+                orig_critic_cfg = critic_cfg
+                if orig_critic_cfg.strategy == "fsdp":
+                    engine_config: FSDPEngineConfig = orig_critic_cfg.model.fsdp_config
+                    engine_config.infer_max_token_len_per_gpu = critic_cfg.ppo_infer_max_token_len_per_gpu
+                    engine_config.max_token_len_per_gpu = critic_cfg.ppo_max_token_len_per_gpu
+                else:
+                    raise NotImplementedError(f"Unknown strategy {orig_critic_cfg.strategy=}")
+
+                critic_cfg = TrainingWorkerConfig(
+                    model_type="value_model",
+                    model_config=orig_critic_cfg.model_config,
+                    engine_config=engine_config,
+                    optimizer_config=orig_critic_cfg.optim,
+                    checkpoint_config=orig_critic_cfg.checkpoint,
+                )
+
             critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=critic_cfg)
             self.resource_pool_to_cls[resource_pool][str(Role.Critic)] = critic_cls
 
@@ -1132,7 +1093,17 @@ class RayPPOTrainer:
 
         if self.use_critic:
             self.critic_wg = all_wg[str(Role.Critic)]
-            self.critic_wg.init_model()
+            if self.use_legacy_worker_impl == "disable":
+                self.critic_wg.reset()
+                # assign critic loss
+                from functools import partial
+
+                from verl.workers.utils.losses import value_loss
+
+                value_loss_ = partial(value_loss, config=orig_critic_cfg)
+                self.critic_wg.set_loss_fn(value_loss_)
+            else:
+                self.critic_wg.init_model()
 
         if self.use_reference_policy and not self.ref_in_actor:
             if str(Role.RefPolicy) in all_wg:
@@ -1145,7 +1116,7 @@ class RayPPOTrainer:
 
         self.rm_wg = None
         # initalization of rm_wg will be deprecated in the future
-        if self.use_rm:
+        if self.use_rm and not self.use_reward_loop:
             self.rm_wg = all_wg[str(Role.RewardModel)]
             self.rm_wg.init_model()
 
@@ -1153,9 +1124,8 @@ class RayPPOTrainer:
         self.actor_rollout_wg = all_wg[str(actor_role)]
         self.actor_rollout_wg.init_model()
 
-        # set transferqueue server info for each worker
-        for _, wg in all_wg.items():
-            wg.create_transferqueue_client(self.config)
+        if self.ref_in_actor:
+            self.ref_policy_wg = self.actor_rollout_wg
 
         # create async rollout manager and request scheduler
         self.async_rollout_mode = False
@@ -1317,7 +1287,7 @@ class RayPPOTrainer:
                 self.ref_policy_wg.start_profile(profile_step=self.global_steps)
             if self.use_critic:
                 self.critic_wg.start_profile(profile_step=self.global_steps)
-            if self.use_rm:
+            if self.use_rm and not self.use_reward_loop:
                 self.rm_wg.start_profile(profile_step=self.global_steps)
 
     def _stop_profiling(self, do_profile: bool) -> None:
