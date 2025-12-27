@@ -1447,7 +1447,7 @@ class RewardModelWorker(MegatronWorker, DistProfilerExtension):
 
     # TODO: reward model use itself tokenizer instead of sft tokenizer
     # the input_ids, responses, attention_mask and position_ids may be different!
-    @tqbridge(put_data=False)
+    @tqbridge(put_data=True)
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="reward"))
     @DistProfiler.annotate(color="brown", role="compute_rm_score")
     def compute_rm_score(self, data: DataProto):

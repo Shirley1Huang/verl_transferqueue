@@ -262,7 +262,7 @@ class RewardLoopManager:
             )
 
     # this func is used to replace the legacy fsdp/megatron RewardModelWorker.compute_rm_score
-    @tqbridge(put_data=False)
+    @tqbridge(put_data=True)
     def compute_rm_score(self, data: DataProto) -> DataProto:
         if self.reward_model_manager is not None:
             self.reward_model_manager.wake_up()
