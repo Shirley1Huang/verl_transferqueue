@@ -175,7 +175,6 @@ def load_reward_manager(
         )
 
 
-# @tqbridge(put_data=False)
 def compute_reward(data: DataProto, reward_fn: AbstractRewardManager) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute reward for a batch of data.

@@ -41,8 +41,6 @@ from verl.utils.torch_functional import allgather_dict_tensors
 
 __all__ = ["DataProto", "union_tensor_dict"]
 
-from verl.utils.transferqueue_utils import tqbridge
-
 with contextlib.suppress(Exception):
     tensordict.set_lazy_legacy(False).set()
     if parse_version(tensordict.__version__) < parse_version("0.10.0"):

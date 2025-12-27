@@ -247,7 +247,8 @@ def compute_advantage(
     num_repeat: int = 1,
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
-) -> Union[tuple[Any, Any], tuple[Any, Any, Any]]:
+)->DataProto:
+# ) -> Union[tuple[Any, Any], tuple[Any, Any, Any]]:
     """Compute advantage estimates for policy optimization.
 
     This function computes advantage estimates using various estimators like GAE, GRPO, REINFORCE++, etc.
@@ -295,7 +296,6 @@ def compute_advantage(
                 # return advantages, returns, pf_ppo_reweight_idx
                 advantages_td = TensorDict(
                     {"advantages": advantages, "returns": returns,
-                     # "pf_ppo_reweight_idx": pf_ppo_reweight_idx,
                      }, batch_size=advantages.size(0)
                 )
                 non_tensor_batch = {"pf_ppo_reweight_idx": pf_ppo_reweight_idx}
@@ -697,7 +697,7 @@ class RayPPOTrainer:
         # Log to each configured logger
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
-    @tqbridge(put_data=False)
+    @tqbridge(put_data=False) # this function is used by both fit&val, therefore cannot set put_data = True
     def _compute_or_extract_reward(
         self,
         batch: DataProto,
@@ -783,17 +783,17 @@ class RayPPOTrainer:
 
         return gen_batch
 
-    def _get_gen_batch_fields(self, batch_field_names: set, non_tensor_batch_keys: set) -> set:
+    def _get_gen_batch_fields(self, non_tensor_batch_keys: set) -> set:
         reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & non_tensor_batch_keys
 
         # pop those keys for generation
-        batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-        non_tensor_batch_keys_to_pop = set(non_tensor_batch_keys) - reward_model_keys
-        gen_batch_field_names = batch_field_names - (batch_keys_to_pop & non_tensor_batch_keys_to_pop)
+        tensor_batch_keys_to_pop = {"input_ids", "attention_mask", "position_ids"}
+        non_tensor_batch_keys_to_pop = non_tensor_batch_keys - reward_model_keys
+        gen_batch_field_names = tensor_batch_keys_to_pop | non_tensor_batch_keys_to_pop
 
         # For agent loop, we need reward model keys to compute score.
         if self.async_rollout_mode:
-            gen_batch_field_names = gen_batch_field_names & non_tensor_batch_keys
+            gen_batch_field_names = gen_batch_field_names | non_tensor_batch_keys
 
         return gen_batch_field_names
 
@@ -840,8 +840,7 @@ class RayPPOTrainer:
             ground_truths = [item.get("ground_truth", None) for item in data.get("reward_model", {})]
             sample_gts.extend(ground_truths)
 
-            test_gen_fields = self._get_gen_batch_fields(set(test_batch_meta.field_names), # namely, batch_meta.field_names
-                                                         set(test_batch.non_tensor_keys))
+            test_gen_fields = self._get_gen_batch_fields(get_non_tensor_keys(test_batch))
             test_gen_meta = test_batch_meta.select_fields(list(test_gen_fields))
             test_gen_meta.extra_info = {
                 "eos_token_id": self.tokenizer.eos_token_id,
@@ -884,7 +883,7 @@ class RayPPOTrainer:
             if "rm_scores" in batch_meta.field_names:
                 compute_reward_fields = ["rm_scores"]
             val_reward_meta = test_batch_meta.select_fields(compute_reward_fields)
-            # val_reward_meta.update_extra_info(test_batch_meta.extra_info) # 不需要，应该自带 test_batch_meta的extra info
+            # val_reward_meta.update_extra_info(test_batch_meta.extra_info) # 不需要? 应该自带 test_batch_meta的extra info
             result = self._compute_or_extract_reward(val_reward_meta, reward_fn=self.val_reward_fn, return_dict=True)
             reward_tensor = result["reward_tensor"]
             scores = reward_tensor.sum(-1).cpu().tolist()
@@ -1389,6 +1388,18 @@ class RayPPOTrainer:
         return repeated_batch_dict
 
     @classmethod
+    def get_non_tensor_keys(cls, td:TensorDict)->set:
+        """
+        Return the non tensor keys of a tensordict
+        Not consider the nested situation
+        """
+        non_tensor_keys = []
+        for key in td.keys():
+            if not td.is_tensor(key):
+                non_tensor_keys.append(key)
+        return set(non_tensor_keys)
+
+    @classmethod
     def dict_to_tensordict(cls, data: dict[str, torch.Tensor | np.ndarray]) -> TensorDict:
         """
         Create a TensorDict from a dict of tensors and non_tensors.
@@ -1419,7 +1430,7 @@ class RayPPOTrainer:
         return TensorDict(tensors_batch, batch_size=batch_size)
 
     # TODO(TQ): 下面几个函数都是12.15检查新增的，先简单用bridge适配
-    @tqbridge(put_data=False)
+    @tqbridge(put_data=True)
     def _compute_values(self, batch: DataProto) -> DataProto:
         if self.use_legacy_worker_impl == "disable":
             batch_td = batch.to_tensordict()
@@ -1437,7 +1448,7 @@ class RayPPOTrainer:
             values = self.critic_wg.compute_values(batch)
         return values
 
-    @tqbridge(put_data=False)
+    @tqbridge(put_data=True)
     def _compute_ref_log_prob(self, batch: DataProto) -> DataProto:
         if self.use_legacy_worker_impl == "disable":
             # step 1: convert dataproto to tensordict.
@@ -1459,8 +1470,8 @@ class RayPPOTrainer:
 
         return ref_log_prob
 
-    @tqbridge(put_data=False)
-    def _compute_old_log_prob(self, batch: DataProto):
+    @tqbridge(put_data=True)
+    def _compute_old_log_prob(self, batch: DataProto) -> DataProto:
         if self.use_legacy_worker_impl == "disable":
             # TODO: remove step 1, 2, 4 after we make the whole training tensordict and padding free
             # step 1: convert dataproto to tensordict.
@@ -1469,7 +1480,7 @@ class RayPPOTrainer:
             batch_td = left_right_2_no_padding(batch_td)
             # step 3: add meta info
             tu.assign_non_tensor(batch_td, calculate_entropy=True, compute_loss=False)
-            output = self.actor_rollout_wg.compute_log_prob(batch_td)
+            output = self.actor_rollout_wg.compute_log_prob(batch_td) # should be a tensordict
             # gather output
             entropy = tu.get(output, "entropy")
             log_probs = tu.get(output, "log_probs")
@@ -1479,13 +1490,15 @@ class RayPPOTrainer:
             log_probs = no_padding_2_padding(log_probs, batch_td)
             # step 5: rebuild a tensordict and convert to dataproto
             old_log_prob = tu.get_tensordict({"old_log_probs": log_probs.float(), "entropys": entropy.float()})
-            old_log_prob = DataProto.from_tensordict(old_log_prob)
+            # old_log_prob = DataProto.from_tensordict(old_log_prob)
+            old_log_prob = DataProto(batch = old_log_prob, non_tensor_batch = {"old_log_prob_mfu": old_log_prob_mfu})
         else:
             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
             old_log_prob_mfu = 0
-        return old_log_prob, old_log_prob_mfu
+            old_log_prob["old_log_prob_mfu"] = old_log_prob_mfu
+        return old_log_prob
 
-    @tqbridge(put_data=False)
+    @tqbridge(put_data=True)
     def _update_actor(self, batch: DataProto) -> DataProto:
         rollout_config = self.config.actor_rollout_ref.rollout
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
@@ -1522,7 +1535,7 @@ class RayPPOTrainer:
             actor_output = self.actor_rollout_wg.update_actor(batch)
         return actor_output
 
-    @tqbridge(put_data=False)
+    @tqbridge(put_data=True)
     def _update_critic(self, batch: DataProto) -> DataProto:
         if self.use_legacy_worker_impl == "disable":
             batch_td = batch.to_tensordict()
@@ -1648,15 +1661,14 @@ class RayPPOTrainer:
                 # TODO(TQ) HY modified: already wrapped _get_gen_batch with @tqbridge
                 # gen_meta = self._get_gen_batch(batch_meta)
                 # 但是实际上不需要经过dataproto做两次转换，可以直接修改需要的fields然后取对应batchmeta
-                gen_batch_fields = self._get_gen_batch_fields(set(batch_meta.field_names),
-                                                              set(batch.non_tensor_keys))
+                gen_batch_fields = self._get_gen_batch_fields(get_non_tensor_keys(batch))
                 gen_meta = batch_meta.select_fields(list(gen_batch_fields))
 
                 # pass global_steps to trace
                 gen_meta.set_extra_info("global_steps", self.global_steps)
 
                 is_last_step = self.global_steps >= self.total_training_steps
-                with marked_timer("step", timing_raw):
+                with (marked_timer("step", timing_raw)):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
                         if not self.async_rollout_mode:
@@ -1705,7 +1717,7 @@ class RayPPOTrainer:
                             # TODO(TQ): new update 1224
                             # Compute or extract reward for REMAX baseline
                             reward_baseline_tensor = self._compute_or_extract_reward(
-                                batch, reward_fn=self.reward_fn, sum_reward=True
+                                compute_reward_meta, reward_fn=self.reward_fn, sum_reward=True
                             )
 
                             reward_baseline_tensor_td = TensorDict({"reward_baselines": reward_baseline_tensor},
@@ -1744,14 +1756,14 @@ class RayPPOTrainer:
                     # TODO: Decouple the DP balancing and mini-batching.
                     balanced_idx = None
                     if self.config.trainer.balance_batch:
-                        attention_mask_meta = asyncio.run(
-                            self.tq_client.async_get_meta(
-                                data_fields=["attention_mask"],
-                                task_name="balance_batch",
-                                **base_get_meta_kwargs,
-                            )
-                        )
-
+                        # attention_mask_meta = asyncio.run(
+                        #     self.tq_client.async_get_meta(
+                        #         data_fields=["attention_mask"],
+                        #         task_name="balance_batch",
+                        #         **base_get_meta_kwargs,
+                        #     )
+                        # )
+                        attention_mask_meta = batch_meta.select_fields(["attention_mask"])
                         balanced_idx = self._balance_batch(attention_mask_meta, self.tq_client, metrics=metrics)
                         batch_meta.reorder(balanced_idx)
 
@@ -1763,10 +1775,11 @@ class RayPPOTrainer:
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch_meta.field_names:
                             if not self.use_reward_loop:
+                                # the results from compute_rm_score should be put into TQ
                                 reward_tensor_meta = self.rm_wg.compute_rm_score(batch_meta)
                             else:
                                 assert self.reward_loop_manager is not None, "RewardLoopManager is None"
-                                reward_tensor_meta = self.rm_wg.compute_rm_score(batch_meta)
+                                reward_tensor_meta = self.reward_loop_manager.compute_rm_score(batch_meta)
                             batch_meta = batch_meta.union(reward_tensor_meta)
 
                         compute_reward_fields = [
@@ -1788,14 +1801,11 @@ class RayPPOTrainer:
                             )
                         else:
                             # TODO(TQ): new update 1224
-                            # reward_tensor, reward_extra_infos_dict = compute_reward_decorated(
-                            #     compute_reward_meta, self.reward_fn
-                            # )
                             reward_tensor, reward_extra_infos_dict = self._compute_or_extract_reward(
-                                batch, reward_fn=self.reward_fn, return_dict=False
+                                compute_reward_meta, reward_fn=self.reward_fn, return_dict=False
                             )
-
-                        batch_meta = batch_meta.union(compute_reward_meta)
+                        # batch_meta = batch_meta.union(compute_reward_meta)
+                        # did not put anything, no need to union
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
@@ -1807,13 +1817,13 @@ class RayPPOTrainer:
                         # TODO(TQ): Need to support different mode: bypass_recomputing_logprobs
                         # however the old log probs is not saved
                         from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
+                        old_log_prob_bypass_meta = batch_meta.select_fields(["rollout_log_probs"])
 
                         old_log_prob_output_meta = apply_bypass_mode(
-                            batch=batch,
+                            batch=old_log_prob_bypass_meta,
                             rollout_corr_config=rollout_corr_config,
                             policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
                         )
-                        # TODO(TQ): check是不是union
                         batch_meta = batch_meta.union(old_log_prob_output_meta)
                     else:  # Recompute old_log_probs
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
@@ -1834,8 +1844,9 @@ class RayPPOTrainer:
                                 "ability",
                             ]
                             old_log_prob_meta = batch_meta.select_fields(old_log_prob_meta_fields)
-                            old_log_prob_output_meta, old_log_prob_mfu = self._compute_old_log_prob(old_log_prob_meta)
-                            data = asyncio.run(self.tq_client.async_get_data(old_log_prob_output_meta))
+                            old_log_prob_output_meta = self._compute_old_log_prob(old_log_prob_meta)
+                            old_log_prob_output_fields = ["response_mask", "old_log_prob", "old_log_prob_mfu"]
+                            data = asyncio.run(self.tq_client.async_get_data(batch_meta.select_fields(old_log_prob_output_fields)))
                             entropys = data["entropys"]
                             response_masks = data["response_mask"]
                             actor_config = self.config.actor_rollout_ref.actor
@@ -1851,8 +1862,8 @@ class RayPPOTrainer:
                             }
                             metrics.update(old_log_prob_metrics)
                             # TODO(TQ): add pop?
-                            # old_log_prob_output_meta.pop("entropys")
-                            old_log_prob_output_field = old_log_prob_output_meta.field_names.remove("entropys")
+                            old_log_prob_output_field = list(set(old_log_prob_output_meta.field_names) - set(
+                                ["entropys", "old_log_prob_mfu"]))
                             old_log_prob_output_meta = old_log_prob_output_meta.select_fields(old_log_prob_output_field)
                             batch_meta = batch_meta.union(old_log_prob_output_meta)
 
@@ -1889,17 +1900,14 @@ class RayPPOTrainer:
                             "ability",
                         ]
                         ref_log_prob_meta = batch_meta.select_fields(ref_log_prob_fields)
-                        with marked_timer("ref", timing_raw, color="olive"):
-                            if not self.ref_in_actor:
-                                ref_log_prob_output_meta = self.ref_policy_wg.compute_ref_log_prob(ref_log_prob_meta)
-                            else:
-                                ref_log_prob_output_meta = self.actor_rollout_wg.compute_ref_log_prob(ref_log_prob_meta)
+                        with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
+                            ref_log_prob_output_meta = self._compute_ref_log_prob(ref_log_prob_meta)
                             batch_meta = batch_meta.union(ref_log_prob_output_meta)
 
                     # compute values
                     if self.use_critic:
                         with marked_timer("values", timing_raw, color="cyan"):
-                            values_meta = self.critic_wg.compute_values(batch_meta)
+                            values_meta = self._compute_values(batch_meta)
                             batch_meta = batch_meta.union(values_meta)
 
                     with marked_timer("adv", timing_raw, color="brown"):
@@ -1929,7 +1937,7 @@ class RayPPOTrainer:
                             token_level_rewards, kl_metrics = apply_kl_penalty(
                                 apply_kl_penalty_meta,
                                 kl_ctrl=self.kl_ctrl_in_reward,
-                                kl_penalty=self.config.algorithm.kl_penalty,
+                                kl_penalty=self.config.algorithm.kl_penalty
                             )
                             token_level_rewards_td = TensorDict(
                                 {"token_level_rewards": token_level_rewards}, batch_size=token_level_rewards.size(0)
@@ -1965,7 +1973,21 @@ class RayPPOTrainer:
 
                             # Compute IS weights, apply rejection sampling, compute metrics
                             # TODO(TQ): is it ok to just apply tqbridge?
-                            batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
+                            rollout_correction_meta = ["old_log_probs",
+                                                       "rollout_log_probs",
+                                                       "response_mask"
+                                                       ]
+                            data, is_metrics = compute_rollout_correction_and_add_to_batch(
+                                rollout_correction_meta, rollout_corr_config) # data is a dataproto
+                            correction_td = TensorDict(
+                                {
+                                    "response_mask": data.batch["response_mask"],
+                                    "rollout_is_weights": data.batch["rollout_is_weights"]
+                                },
+                                batch_size = data.batch["rollout_is_weights"].size(0)
+                            )
+                            batch_meta = asyncio.run(
+                                self.tq_client.async_put(data = correction_td, metadata = batch_meta))
                             # IS and off-policy metrics already have rollout_corr/ prefix
                             metrics.update(is_metrics)
 
@@ -1999,18 +2021,6 @@ class RayPPOTrainer:
                                 compute_advantage_fields.append("reward_baselines")
 
                         compute_advantage_meta = batch_meta.select_fields(compute_advantage_fields)
-
-                        # resampled_idx = None
-                        # advantages, returns, resampled_idx = compute_advantage(
-                        #     compute_advantage_meta,
-                        #     adv_estimator=self.config.algorithm.adv_estimator,
-                        #     gamma=self.config.algorithm.gamma,
-                        #     lam=self.config.algorithm.lam,
-                        #     num_repeat=self.config.actor_rollout_ref.rollout.n,
-                        #     norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                        #     config=self.config.algorithm,
-                        # )
-
                         compute_advantage_meta = compute_advantage(
                             compute_advantage_meta,
                             adv_estimator=self.config.algorithm.adv_estimator,
@@ -2027,11 +2037,12 @@ class RayPPOTrainer:
                             resample_idx_meta = batch_meta.select_fields(["pf_ppo_reweight_idx"])
                             resampled_idx = asyncio.run(tq_client.async_get_data(resample_idx_meta)) # list of int
                             batch_meta.reorder(resampled_idx)
+                            # the reorder part is inside compute adv originally
 
                     # update critic
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):
-                            critic_output_meta = self.critic_wg.update_critic(batch_meta)
+                            critic_output_meta = self._update_critic(batch_meta)
                             batch_meta = batch_meta.union(critic_output_meta)
                         critic_output_metrics = reduce_metrics(critic_output_meta.extra_info["metrics"])
                         metrics.update(critic_output_metrics)
@@ -2040,10 +2051,6 @@ class RayPPOTrainer:
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
-                            batch_meta.extra_info["multi_turn"] = (
-                                self.config.actor_rollout_ref.rollout.multi_turn.enable
-                            )
-
                             update_actor_fields = [
                                 "input_ids",
                                 "attention_mask",
@@ -2067,13 +2074,8 @@ class RayPPOTrainer:
                                 "ability",
                             ]
                             update_actor_meta = batch_meta.select_fields(update_actor_fields)
-                            update_actor_meta.set_extra_info(
-                                "global_token_num", batch_meta.get_extra_info("global_token_num")
-                            )
-                            update_actor_meta.set_extra_info("temperature", batch_meta.get_extra_info("temperature"))
-
-                            actor_output_meta = self.actor_rollout_wg.update_actor(update_actor_meta)
-                            batch_meta = batch_meta.union(actor_output_meta)
+                            actor_output_meta = self._update_actor(update_actor_meta)
+                            # batch_meta = batch_meta.union(actor_output_meta)
                         actor_output_metrics = reduce_metrics(actor_output_meta.extra_info["metrics"])
                         metrics.update(actor_output_metrics)
 
@@ -2086,7 +2088,7 @@ class RayPPOTrainer:
                         log_rollout_meta = batch_meta.select_fields(log_rollout_fields)
                         self._log_rollout_data(log_rollout_meta, reward_extra_infos_dict, timing_raw, rollout_data_dir)
 
-                # TODO: validate - check if is done
+                # TODO(TQ) HY modified: validate - check if is done
                 if (
                     self.val_reward_fn is not None
                     and self.config.trainer.test_freq > 0
@@ -2156,27 +2158,31 @@ class RayPPOTrainer:
                     compute_data_metrics_fields.append("__num_turns__")
                 if "tool_call_counts" in batch_meta.field_names:
                     compute_data_metrics_fields.append("tool_call_counts")
-                compute_data_metrics_meta = asyncio.run(
-                    self.tq_client.async_get_meta(
-                        data_fields=compute_data_metrics_fields,
-                        task_name="compute_data_metrics",
-                        **base_get_meta_kwargs,
-                    )
-                )
-                compute_data_metrics_meta.reorder(balanced_idx)
+                if self.use_critic:
+                    compute_data_metrics_fields.append("values")
+                # compute_data_metrics_meta = asyncio.run(
+                #     self.tq_client.async_get_meta(
+                #         data_fields=compute_data_metrics_fields,
+                #         task_name="compute_data_metrics",
+                #         **base_get_meta_kwargs,
+                #     )
+                # )
+                # compute_data_metrics_meta.reorder(balanced_idx)
+                compute_data_metrics_meta = batch_meta.select_fields(compute_data_metrics_fields)
                 metrics.update(
                     compute_data_metrics_decorated(batch=compute_data_metrics_meta, use_critic=self.use_critic)
                 )
 
                 compute_timing_metrics_fields = ["responses", "attention_mask"]
-                compute_timing_metrics_meta = asyncio.run(
-                    self.tq_client.async_get_meta(
-                        data_fields=compute_timing_metrics_fields,
-                        task_name="compute_timing_metrics",
-                        **base_get_meta_kwargs,
-                    )
-                )
-                compute_timing_metrics_meta.reorder(balanced_idx)
+                # compute_timing_metrics_meta = asyncio.run(
+                #     self.tq_client.async_get_meta(
+                #         data_fields=compute_timing_metrics_fields,
+                #         task_name="compute_timing_metrics",
+                #         **base_get_meta_kwargs,
+                #     )
+                # )
+                # compute_timing_metrics_meta.reorder(balanced_idx)
+                compute_timing_metrics_meta = batch_meta.select_fields(compute_timing_metrics_fields)
                 metrics.update(
                     compute_timing_metrics_decorated(batch=compute_timing_metrics_meta, timing_raw=timing_raw)
                 )
@@ -2192,6 +2198,7 @@ class RayPPOTrainer:
                         batch=compute_throughout_metrics_meta, timing_raw=timing_raw, n_gpus=n_gpus
                     )
                 )
+                # Note: mismatch metrics (KL, PPL, etc.) are collected at line 1179 after advantage computation
 
                 # this is experimental and may be changed/removed in the future in favor of a general-purpose one
                 if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
@@ -2226,5 +2233,4 @@ class RayPPOTrainer:
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
                     # TODO (TQ): support transfer queue
-                    # qianmeng
                     self.train_dataset.on_batch_end(batch=batch)
