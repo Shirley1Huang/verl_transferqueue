@@ -2036,7 +2036,8 @@ class RayPPOTrainer:
                             # resample the idx of batch meta
                             resample_idx_meta = batch_meta.select_fields(["pf_ppo_reweight_idx"])
                             resampled_idx = asyncio.run(tq_client.async_get_data(resample_idx_meta)) # list of int
-                            batch_meta.reorder(resampled_idx)
+                            # batch_meta.reorder(resampled_idx)
+                            batch_meta.resample(resampled_idx)
                             # the reorder part is inside compute adv originally
 
                     # update critic
